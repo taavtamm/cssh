@@ -11,7 +11,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/taavitammiste/cssh/config"
+	"github.com/taavtamm/cssh/config"
 )
 
 type clearStatusMsg struct{}

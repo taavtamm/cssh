@@ -1,4 +1,4 @@
-module github.com/taavitammiste/cssh
+module github.com/taavtamm/cssh
 
 go 1.22
 

@@ -7,8 +7,8 @@ import (
 	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/taavitammiste/cssh/config"
-	"github.com/taavitammiste/cssh/tui"
+	"github.com/taavtamm/cssh/config"
+	"github.com/taavtamm/cssh/tui"
 )
 
 func main() {

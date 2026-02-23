@@ -5,13 +5,13 @@ Terminal UI for managing and connecting to SSH hosts. Stores connections in `~/.
 ## Install
 
 ```
-go install github.com/taavitammiste/cssh@latest
+go install github.com/taavtamm/cssh@latest
 ```
 
 Or clone and build:
 
 ```
-git clone https://github.com/taavitammiste/cssh.git
+git clone https://github.com/taavtamm/cssh.git
 cd cssh
 make install
 ```

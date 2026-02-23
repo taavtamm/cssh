@@ -7,7 +7,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/taavitammiste/cssh/config"
+	"github.com/taavtamm/cssh/config"
 )
 
 // Form field indices
