@@ -287,14 +287,7 @@ func (m formModel) viewForm(title string, width int) string {
 	sb.WriteString(formSectionStyle.Render(dividerLine("Port Forwards", width)) + "\n")
 
 	for _, pf := range m.portForwards {
-		var pfStr string
-		switch pf.Type {
-		case "D":
-			pfStr = fmt.Sprintf("D:%d", pf.LocalPort)
-		default:
-			pfStr = fmt.Sprintf("%s:%d → %s:%d", pf.Type, pf.LocalPort, pf.RemoteHost, pf.RemotePort)
-		}
-		sb.WriteString(pfItemStyle.Render("  • "+pfStr) + "\n")
+		sb.WriteString(pfItemStyle.Render("  • "+pfDisplay(pf)) + "\n")
 	}
 
 	sb.WriteString(helpStyle.Render("  ctrl+f add forward  ctrl+r remove last") + "\n")
@@ -371,11 +364,4 @@ func dividerLine(label string, width int) string {
 		dashes = 2
 	}
 	return fmt.Sprintf("─── %s %s", label, strings.Repeat("─", dashes))
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

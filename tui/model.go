@@ -9,12 +9,14 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/charmbracelet/lipgloss"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/taavtamm/cssh/config"
 )
 
-type clearStatusMsg struct{}
+// clearStatusMsg clears the status message it was scheduled for; gen guards
+// against a stale timer wiping a newer message.
+type clearStatusMsg struct{ gen int }
 
 type state int
 
@@ -52,6 +54,7 @@ type Model struct {
 	searchQuery   string
 	editingItem   *listItem
 	statusMsg     string // transient message (e.g. "Copied!")
+	statusGen     int
 }
 
 func New(cfg *config.Config) Model {
@@ -143,13 +146,56 @@ func (m *Model) moveCursor(dir int) {
 	}
 }
 
+// selectedItem returns the connection item under the cursor, or nil if the
+// cursor is out of range or on a group header.
+func (m *Model) selectedItem() *listItem {
+	fi := m.filteredItems()
+	if m.cursor >= len(fi) {
+		return nil
+	}
+	item := fi[m.cursor]
+	if item.isGroup || item.conn == nil {
+		return nil
+	}
+	return &item
+}
+
+// setStatus shows a transient status message and schedules it to clear.
+func (m *Model) setStatus(text string) tea.Cmd {
+	m.statusMsg = text
+	m.statusGen++
+	gen := m.statusGen
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+		return clearStatusMsg{gen: gen}
+	})
+}
+
+// saveConfig persists the config and surfaces any error as a sticky status message.
+func (m *Model) saveConfig() {
+	if err := config.Save(m.cfg); err != nil {
+		m.statusMsg = "Save failed: " + err.Error()
+		m.statusGen++ // invalidate pending clear timers so the error stays visible
+	}
+}
+
+func (m *Model) beginEdit(item listItem) {
+	m.availableKeys = config.ListSSHKeys()
+	m.keyPickerIdx = 0
+	m.editingItem = &item
+	m.form = newFormModel(item.conn, item.groupName)
+	m.state = stateEdit
+	m.statusMsg = ""
+}
+
 // ── Bubble Tea ─────────────────────────────────────────────────────────────
 
 func (m Model) Init() tea.Cmd { return nil }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if _, ok := msg.(clearStatusMsg); ok {
-		m.statusMsg = ""
+	if msg, ok := msg.(clearStatusMsg); ok {
+		if msg.gen == m.statusGen {
+			m.statusMsg = ""
+		}
 		return m, nil
 	}
 	switch m.state {
@@ -189,56 +235,37 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.moveCursor(1)
 
 		case "enter", " ":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) {
-				if item := fi[m.cursor]; !item.isGroup && item.conn != nil {
-					m.ConnectTo = item.conn
-					return m, tea.Quit
-				}
+			if item := m.selectedItem(); item != nil {
+				m.ConnectTo = item.conn
+				return m, tea.Quit
 			}
 
 		case "y":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) {
-				if item := fi[m.cursor]; !item.isGroup && item.conn != nil {
-					if err := copyToClipboard(item.conn.BuildCommand()); err != nil {
-						m.statusMsg = "Copy failed: " + err.Error()
-					} else {
-						m.statusMsg = "Command copied!"
-					}
-					return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-						return clearStatusMsg{}
-					})
+			if item := m.selectedItem(); item != nil {
+				if err := copyToClipboard(item.conn.BuildCommand()); err != nil {
+					return m, m.setStatus("Copy failed: " + err.Error())
 				}
+				return m, m.setStatus("Command copied!")
 			}
 
 		case "i":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) {
-				if item := fi[m.cursor]; !item.isGroup && item.conn != nil {
-					m.state = stateDetail
-					m.statusMsg = ""
-				}
+			if m.selectedItem() != nil {
+				m.state = stateDetail
+				m.statusMsg = ""
 			}
 
 		case "c":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) {
-				if item := fi[m.cursor]; !item.isGroup && item.conn != nil {
-					cloned := *item.conn
-					cloned.Name = cloned.Name + " (copy)"
-					if len(cloned.PortForwards) > 0 {
-						pfs := make([]config.PortForward, len(cloned.PortForwards))
-						copy(pfs, cloned.PortForwards)
-						cloned.PortForwards = pfs
-					}
-					m.availableKeys = config.ListSSHKeys()
-					m.keyPickerIdx = 0
-					m.form = newFormModel(&cloned, item.groupName)
-					m.form.isEdit = false
-					m.state = stateAdd
-					m.statusMsg = ""
-				}
+			if item := m.selectedItem(); item != nil {
+				cloned := *item.conn
+				cloned.Name = cloned.Name + " (copy)"
+				cloned.Tags = append([]string(nil), cloned.Tags...)
+				cloned.PortForwards = append([]config.PortForward(nil), cloned.PortForwards...)
+				m.availableKeys = config.ListSSHKeys()
+				m.keyPickerIdx = 0
+				m.form = newFormModel(&cloned, item.groupName)
+				m.form.isEdit = false
+				m.state = stateAdd
+				m.statusMsg = ""
 			}
 
 		case "a":
@@ -252,22 +279,12 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = ""
 
 		case "e":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) {
-				item := fi[m.cursor]
-				if !item.isGroup && item.conn != nil {
-					m.availableKeys = config.ListSSHKeys()
-					m.keyPickerIdx = 0
-					m.editingItem = &item
-					m.form = newFormModel(item.conn, item.groupName)
-					m.state = stateEdit
-					m.statusMsg = ""
-				}
+			if item := m.selectedItem(); item != nil {
+				m.beginEdit(*item)
 			}
 
 		case "d":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) && !fi[m.cursor].isGroup {
+			if m.selectedItem() != nil {
 				m.state = stateConfirmDelete
 				m.statusMsg = ""
 			}
@@ -279,11 +296,9 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "T":
 			theme := NextTheme()
 			m.cfg.ThemeName = theme.Name
-			config.Save(m.cfg)
-			m.statusMsg = "Theme: " + theme.Name
-			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-				return clearStatusMsg{}
-			})
+			cmd := m.setStatus("Theme: " + theme.Name)
+			m.saveConfig()
+			return m, cmd
 		}
 	}
 	return m, nil
@@ -303,9 +318,10 @@ func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchQuery = string(runes[:len(runes)-1])
 			m.resetCursor()
 		}
-	case "up", "k":
+	// Only non-printing keys navigate here: j/k must remain typeable in the query.
+	case "up", "ctrl+p":
 		m.moveCursor(-1)
-	case "down", "j":
+	case "down", "ctrl+n":
 		m.moveCursor(1)
 	default:
 		if s := msg.String(); utf8.RuneCountInString(s) == 1 {
@@ -338,6 +354,7 @@ func (m Model) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+f":
 			m.form.clearPFInputs()
 			m.form.editingPF = false
+			m.form.errMsg = ""
 			m.state = stateAddPortFwd
 			return m, nil
 		case "ctrl+r":
@@ -454,7 +471,7 @@ func (m Model) updateKeyPicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 				key := m.availableKeys[m.keyPickerIdx]
 				m.form.inputs[fieldIdentity].SetValue(key)
 				m.cfg.DefaultIdentityFile = key
-				config.Save(m.cfg)
+				m.saveConfig()
 			}
 			m.state = back()
 		}
@@ -472,24 +489,13 @@ func (m Model) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc", "q":
 			m.state = stateList
 		case "enter":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) {
-				if item := fi[m.cursor]; !item.isGroup && item.conn != nil {
-					m.ConnectTo = item.conn
-					return m, tea.Quit
-				}
+			if item := m.selectedItem(); item != nil {
+				m.ConnectTo = item.conn
+				return m, tea.Quit
 			}
 		case "e":
-			fi := m.filteredItems()
-			if m.cursor < len(fi) {
-				item := fi[m.cursor]
-				if !item.isGroup && item.conn != nil {
-					m.availableKeys = config.ListSSHKeys()
-					m.keyPickerIdx = 0
-					m.editingItem = &item
-					m.form = newFormModel(item.conn, item.groupName)
-					m.state = stateEdit
-				}
+			if item := m.selectedItem(); item != nil {
+				m.beginEdit(*item)
 			}
 		}
 	}
@@ -502,22 +508,9 @@ func (m *Model) saveConnection(conn *config.Connection, groupName string) {
 	if m.state == stateEdit && m.editingItem != nil {
 		item := m.editingItem
 		if item.groupName != groupName {
-			// Remove from old group
-			for gi := range m.cfg.Groups {
-				if m.cfg.Groups[gi].Name == item.groupName {
-					conns := m.cfg.Groups[gi].Connections
-					for ci, c := range conns {
-						if c.Name == item.conn.Name {
-							m.cfg.Groups[gi].Connections = append(conns[:ci], conns[ci+1:]...)
-							break
-						}
-					}
-					if len(m.cfg.Groups[gi].Connections) == 0 {
-						m.cfg.Groups = append(m.cfg.Groups[:gi], m.cfg.Groups[gi+1:]...)
-					}
-					break
-				}
-			}
+			// Remove from the old group by index — name matching would hit the
+			// wrong entry when two connections in a group share a name.
+			m.removeConnection(item.groupIdx, item.connIdx)
 			m.addToGroup(conn, groupName)
 		} else {
 			m.cfg.Groups[item.groupIdx].Connections[item.connIdx] = *conn
@@ -527,7 +520,7 @@ func (m *Model) saveConnection(conn *config.Connection, groupName string) {
 	}
 	m.editingItem = nil
 	m.rebuildItems()
-	config.Save(m.cfg)
+	m.saveConfig()
 	// Park cursor on the saved item
 	for i, item := range m.filteredItems() {
 		if !item.isGroup && item.conn != nil && item.conn.Name == conn.Name && item.groupName == groupName {
@@ -551,15 +544,19 @@ func (m *Model) addToGroup(conn *config.Connection, groupName string) {
 }
 
 func (m *Model) deleteSelected() {
-	fi := m.filteredItems()
-	if m.cursor >= len(fi) {
+	item := m.selectedItem()
+	if item == nil {
 		return
 	}
-	item := fi[m.cursor]
-	if item.isGroup {
-		return
-	}
-	gi, ci := item.groupIdx, item.connIdx
+	m.removeConnection(item.groupIdx, item.connIdx)
+	m.rebuildItems()
+	m.saveConfig()
+	m.resetCursor()
+}
+
+// removeConnection deletes the connection at the given config indices,
+// dropping the group if it becomes empty.
+func (m *Model) removeConnection(gi, ci int) {
 	m.cfg.Groups[gi].Connections = append(
 		m.cfg.Groups[gi].Connections[:ci],
 		m.cfg.Groups[gi].Connections[ci+1:]...,
@@ -567,9 +564,6 @@ func (m *Model) deleteSelected() {
 	if len(m.cfg.Groups[gi].Connections) == 0 {
 		m.cfg.Groups = append(m.cfg.Groups[:gi], m.cfg.Groups[gi+1:]...)
 	}
-	m.rebuildItems()
-	config.Save(m.cfg)
-	m.resetCursor()
 }
 
 func copyToClipboard(text string) error {
@@ -591,6 +585,58 @@ func copyToClipboard(text string) error {
 }
 
 // ── Views ──────────────────────────────────────────────────────────────────
+
+// boxLine pads styled content to fill inner width and wraps it in │ borders.
+func boxLine(inner int, content string) string {
+	pad := inner - lipgloss.Width(content)
+	if pad < 0 {
+		pad = 0
+	}
+	return borderStyle.Render("│") + content + strings.Repeat(" ", pad) + borderStyle.Render("│")
+}
+
+// boxTop renders the top border with a title embedded.
+func boxTop(inner int, title string) string {
+	titleStyled := titleStyle.Render(title)
+	fill := inner - 1 - lipgloss.Width(titleStyled)
+	if fill < 0 {
+		fill = 0
+	}
+	return borderStyle.Render("╭─") + titleStyled + borderStyle.Render(strings.Repeat("─", fill)+"╮")
+}
+
+// hostDisplay renders "user@host :port" for a connection, "" if it has no host.
+func hostDisplay(c *config.Connection) string {
+	if c.Host == "" {
+		return ""
+	}
+	s := c.Host
+	if c.User != "" {
+		s = c.User + "@" + c.Host
+	}
+	if c.Port > 0 && c.Port != 22 {
+		s += fmt.Sprintf(" :%d", c.Port)
+	}
+	return s
+}
+
+// pfDisplay renders a port forward like "L:8080 → localhost:80" or "D:1080".
+// It accepts both the short ("L") and long ("local") type spellings.
+func pfDisplay(pf config.PortForward) string {
+	t := strings.ToUpper(pf.Type)
+	switch t {
+	case "LOCAL":
+		t = "L"
+	case "REMOTE":
+		t = "R"
+	case "DYNAMIC":
+		t = "D"
+	}
+	if t == "D" {
+		return fmt.Sprintf("D:%d", pf.LocalPort)
+	}
+	return fmt.Sprintf("%s:%d → %s:%d", t, pf.LocalPort, pf.RemoteHost, pf.RemotePort)
+}
 
 func (m Model) View() string {
 	switch m.state {
@@ -620,59 +666,43 @@ func (m Model) viewList() string {
 		boxW = 44
 	}
 	inner := boxW - 2 // content width between the │ chars
+	line := func(content string) string { return boxLine(inner, content) }
 
-	// boxLine pads styled content to fill inner width then wraps with │ borders.
-	boxLine := func(content string) string {
-		w := lipgloss.Width(content)
-		pad := inner - w
-		if pad < 0 {
-			pad = 0
-		}
-		return borderStyle.Render("│") + content + strings.Repeat(" ", pad) + borderStyle.Render("│")
-	}
-
-	// ── Top border with title embedded ──
-	titleText := " cssh · ssh connection manager "
-	titleStyled := titleStyle.Render(titleText)
-	borderFill := inner - 1 - lipgloss.Width(titleStyled)
-	if borderFill < 0 {
-		borderFill = 0
-	}
-	sb.WriteString(borderStyle.Render("╭─") + titleStyled + borderStyle.Render(strings.Repeat("─", borderFill)+"╮") + "\n")
-	sb.WriteString(boxLine("") + "\n")
+	sb.WriteString(boxTop(inner, " cssh · ssh connection manager ") + "\n")
+	sb.WriteString(line("") + "\n")
 
 	// ── Connection list ──
 	fi := m.filteredItems()
 	if len(fi) == 0 {
 		if m.searchQuery != "" {
-			sb.WriteString(boxLine(helpStyle.Render("  No matches for \""+m.searchQuery+"\"")) + "\n")
+			sb.WriteString(line(helpStyle.Render("  No matches for \""+m.searchQuery+"\"")) + "\n")
 		} else {
-			sb.WriteString(boxLine(helpStyle.Render("  No connections — press 'a' to add one.")) + "\n")
+			sb.WriteString(line(helpStyle.Render("  No connections — press 'a' to add one.")) + "\n")
 		}
 	} else {
 		for i, item := range fi {
-			sb.WriteString(boxLine(m.renderItem(i, item, fi)) + "\n")
+			sb.WriteString(line(m.renderItem(i, item, fi)) + "\n")
 		}
 	}
 
-	sb.WriteString(boxLine("") + "\n")
+	sb.WriteString(line("") + "\n")
 
 	// ── Middle divider ──
 	sb.WriteString(borderStyle.Render("├"+strings.Repeat("─", inner)+"┤") + "\n")
 
 	// ── Footer ──
 	if m.searchActive {
-		sb.WriteString(boxLine(searchActiveStyle.Render("  /"+m.searchQuery+"█")) + "\n")
-		sb.WriteString(boxLine(helpStyle.Render("  type to filter  ↑↓ navigate  enter confirm  esc clear")) + "\n")
+		sb.WriteString(line(searchActiveStyle.Render("  /"+m.searchQuery+"█")) + "\n")
+		sb.WriteString(line(helpStyle.Render("  type to filter  ↑↓ navigate  enter confirm  esc clear")) + "\n")
 	} else {
-		sb.WriteString(boxLine(helpStyle.Render("  ↑↓/jk move  enter connect  i detail  / search  y copy  c dup  a add  e edit  d del  T theme  q quit")) + "\n")
+		sb.WriteString(line(helpStyle.Render("  ↑↓/jk move  enter connect  i detail  / search  y copy  c dup  a add  e edit  d del  T theme  q quit")) + "\n")
 		if m.searchQuery != "" {
-			sb.WriteString(boxLine(helpStyle.Render("  filter: "+m.searchQuery)) + "\n")
+			sb.WriteString(line(helpStyle.Render("  filter: "+m.searchQuery)) + "\n")
 		}
 		if m.statusMsg != "" {
-			sb.WriteString(boxLine(successStyle.Render("  "+m.statusMsg)) + "\n")
+			sb.WriteString(line(successStyle.Render("  "+m.statusMsg)) + "\n")
 		}
-		sb.WriteString(boxLine(themeNameStyle.Render("  "+CurrentTheme().Name)) + "\n")
+		sb.WriteString(line(themeNameStyle.Render("  "+CurrentTheme().Name)) + "\n")
 	}
 
 	// ── Bottom border ──
@@ -682,12 +712,8 @@ func (m Model) viewList() string {
 }
 
 func (m Model) viewDetail() string {
-	fi := m.filteredItems()
-	if m.cursor >= len(fi) {
-		return ""
-	}
-	item := fi[m.cursor]
-	if item.isGroup || item.conn == nil {
+	item := m.selectedItem()
+	if item == nil {
 		return ""
 	}
 	conn := item.conn
@@ -697,27 +723,12 @@ func (m Model) viewDetail() string {
 		boxW = 50
 	}
 	inner := boxW - 2
-
-	boxLine := func(content string) string {
-		w := lipgloss.Width(content)
-		pad := inner - w
-		if pad < 0 {
-			pad = 0
-		}
-		return borderStyle.Render("│") + content + strings.Repeat(" ", pad) + borderStyle.Render("│")
-	}
+	line := func(content string) string { return boxLine(inner, content) }
 
 	var sb strings.Builder
 
-	// Top border with title
-	titleText := " Connection Details "
-	titleStyled := titleStyle.Render(titleText)
-	borderFill := inner - 1 - lipgloss.Width(titleStyled)
-	if borderFill < 0 {
-		borderFill = 0
-	}
-	sb.WriteString(borderStyle.Render("╭─") + titleStyled + borderStyle.Render(strings.Repeat("─", borderFill)+"╮") + "\n")
-	sb.WriteString(boxLine("") + "\n")
+	sb.WriteString(boxTop(inner, " Connection Details ") + "\n")
+	sb.WriteString(line("") + "\n")
 
 	// Detail rows
 	field := func(label, value string) {
@@ -725,25 +736,12 @@ func (m Model) viewDetail() string {
 			return
 		}
 		styled := formLabelStyle.Render(fmt.Sprintf("  %-16s", label)) + connNameStyle.Render(value)
-		sb.WriteString(boxLine(styled) + "\n")
+		sb.WriteString(line(styled) + "\n")
 	}
 
 	field("Name", conn.Name)
 	field("Group", item.groupName)
-
-	// Host info
-	hostInfo := ""
-	if conn.Host != "" {
-		if conn.User != "" {
-			hostInfo = conn.User + "@" + conn.Host
-		} else {
-			hostInfo = conn.Host
-		}
-		if conn.Port > 0 && conn.Port != 22 {
-			hostInfo += fmt.Sprintf(" :%d", conn.Port)
-		}
-	}
-	field("Host", hostInfo)
+	field("Host", hostDisplay(conn))
 	field("Identity", conn.IdentityFile)
 
 	// Tags
@@ -753,7 +751,7 @@ func (m Model) viewDetail() string {
 			tagBadges = append(tagBadges, tagStyle(tag).Render(tag))
 		}
 		styled := formLabelStyle.Render(fmt.Sprintf("  %-16s", "Tags")) + strings.Join(tagBadges, " ")
-		sb.WriteString(boxLine(styled) + "\n")
+		sb.WriteString(line(styled) + "\n")
 	}
 
 	field("Extra Args", conn.ExtraArgs)
@@ -762,30 +760,23 @@ func (m Model) viewDetail() string {
 
 	// Port forwards
 	if len(conn.PortForwards) > 0 {
-		sb.WriteString(boxLine("") + "\n")
-		sb.WriteString(boxLine(formSectionStyle.Render("  Port Forwards")) + "\n")
+		sb.WriteString(line("") + "\n")
+		sb.WriteString(line(formSectionStyle.Render("  Port Forwards")) + "\n")
 		for _, pf := range conn.PortForwards {
-			var pfStr string
-			switch strings.ToUpper(pf.Type) {
-			case "D":
-				pfStr = fmt.Sprintf("D:%d", pf.LocalPort)
-			default:
-				pfStr = fmt.Sprintf("%s:%d → %s:%d", strings.ToUpper(pf.Type), pf.LocalPort, pf.RemoteHost, pf.RemotePort)
-			}
-			sb.WriteString(boxLine(pfItemStyle.Render("  • "+pfStr)) + "\n")
+			sb.WriteString(line(pfItemStyle.Render("  • "+pfDisplay(pf))) + "\n")
 		}
 	}
 
 	// SSH Command
-	sb.WriteString(boxLine("") + "\n")
-	sb.WriteString(boxLine(formSectionStyle.Render("  SSH Command")) + "\n")
-	sb.WriteString(boxLine(connHostStyle.Render("  "+conn.BuildCommand())) + "\n")
+	sb.WriteString(line("") + "\n")
+	sb.WriteString(line(formSectionStyle.Render("  SSH Command")) + "\n")
+	sb.WriteString(line(connHostStyle.Render("  "+conn.BuildCommand())) + "\n")
 
-	sb.WriteString(boxLine("") + "\n")
+	sb.WriteString(line("") + "\n")
 
 	// Footer
 	sb.WriteString(borderStyle.Render("├"+strings.Repeat("─", inner)+"┤") + "\n")
-	sb.WriteString(boxLine(helpStyle.Render("  enter connect  e edit  esc back")) + "\n")
+	sb.WriteString(line(helpStyle.Render("  enter connect  e edit  esc back")) + "\n")
 	sb.WriteString(borderStyle.Render("╰"+strings.Repeat("─", inner)+"╯") + "\n")
 
 	return sb.String()
@@ -837,18 +828,9 @@ func (m Model) renderItem(idx int, item listItem, fi []listItem) string {
 	}
 
 	// Host info
-	hostInfo := ""
-	if item.conn.Command != "" {
-		hostInfo = item.conn.Command
-	} else if item.conn.Host != "" {
-		if item.conn.User != "" {
-			hostInfo = item.conn.User + "@" + item.conn.Host
-		} else {
-			hostInfo = item.conn.Host
-		}
-		if item.conn.Port > 0 && item.conn.Port != 22 {
-			hostInfo += fmt.Sprintf(" :%d", item.conn.Port)
-		}
+	hostInfo := item.conn.Command
+	if hostInfo == "" {
+		hostInfo = hostDisplay(item.conn)
 	}
 
 	if isSelected {
@@ -862,12 +844,8 @@ func (m Model) renderItem(idx int, item listItem, fi []listItem) string {
 }
 
 func (m Model) viewConfirm() string {
-	fi := m.filteredItems()
-	if m.cursor >= len(fi) {
-		return ""
-	}
-	item := fi[m.cursor]
-	if item.isGroup || item.conn == nil {
+	item := m.selectedItem()
+	if item == nil {
 		return ""
 	}
 	return "\n" + confirmStyle.Render(fmt.Sprintf("  Delete '%s'? (y/n)", item.conn.Name)) + "\n"

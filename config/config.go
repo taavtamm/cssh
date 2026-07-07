@@ -6,10 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 type PortForward struct {
-	Type       string `json:"type"`        // "local" (-L), "remote" (-R), "dynamic" (-D)
+	Type       string `json:"type"` // "local" (-L), "remote" (-R), "dynamic" (-D)
 	LocalPort  int    `json:"local_port"`
 	RemoteHost string `json:"remote_host"` // empty for dynamic
 	RemotePort int    `json:"remote_port"` // empty for dynamic
@@ -69,7 +70,13 @@ func Save(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("serializing config: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	// Write to a temp file and rename so a crash mid-write can't corrupt the config.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("writing config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("writing config: %w", err)
 	}
 	return nil
@@ -104,7 +111,7 @@ func (c *Connection) BuildArgs() (string, []string) {
 	}
 
 	if c.ExtraArgs != "" {
-		args = append(args, strings.Fields(c.ExtraArgs)...)
+		args = append(args, SplitArgs(c.ExtraArgs)...)
 	}
 
 	if c.User != "" {
@@ -117,13 +124,64 @@ func (c *Connection) BuildArgs() (string, []string) {
 }
 
 // BuildCommand returns the full command as a single string for display/clipboard purposes.
+// Arguments are shell-quoted so the result can be pasted into a shell verbatim.
 func (c *Connection) BuildCommand() string {
 	if c.Command != "" {
 		return c.Command
 	}
 
 	bin, args := c.BuildArgs()
-	return bin + " " + strings.Join(args, " ")
+	parts := []string{bin}
+	for _, a := range args {
+		parts = append(parts, shellQuote(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+// SplitArgs splits s on whitespace, honoring single and double quotes, so
+// values like -o ProxyCommand="ssh -W %h:%p jump" survive as one argument.
+// Backslash escapes are not interpreted.
+func SplitArgs(s string) []string {
+	var args []string
+	var cur strings.Builder
+	var quote rune
+	inToken := false
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+			inToken = true
+		case unicode.IsSpace(r):
+			if inToken {
+				args = append(args, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			inToken = true
+		}
+	}
+	if inToken {
+		args = append(args, cur.String())
+	}
+	return args
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\n\"'\\$`&|;<>(){}[]*?#~") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // ListSSHKeys returns the paths of private key files found in ~/.ssh/.
@@ -136,11 +194,11 @@ func ListSSHKeys() []string {
 		return nil
 	}
 	skip := map[string]bool{
-		"known_hosts":      true,
-		"known_hosts.old":  true,
-		"authorized_keys":  true,
-		"config":           true,
-		"environment":      true,
+		"known_hosts":     true,
+		"known_hosts.old": true,
+		"authorized_keys": true,
+		"config":          true,
+		"environment":     true,
 	}
 	var keys []string
 	for _, e := range entries {
